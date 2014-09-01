@@ -9,6 +9,11 @@
 #include <assert.h>
 #include <string.h>
 
+#include <netinet/in.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 #include "ZWaitObj.h"
 #include "ZSyncObj.h"
 
@@ -27,8 +32,10 @@
 struct termios org_opts, new_opts;
 char g_chCommand = '\0';
 
-//#define CONTROL_BY_KEYBORD
-#define CONTROL_BY_IR
+//#define CONTROL_BY_KEYBOARD 1
+//#define CONTROL_BY_IR       1
+#define CONTROL_BY_SOCKET   1
+
 #if defined CONTROL_BY_IR
 	#define PIN_IR_A	25
 	#define PIN_IR_B	24
@@ -250,8 +257,10 @@ void CatchSignal(int n,struct siginfo *siginfo,void *myact)
 	digitalWrite(PIN_FL1, 0);
 	digitalWrite(PIN_FL2, 0);
 
+#if defined (CONTROL_BY_KEYBOARD)
 	//restore old settings
 	tcsetattr(STDIN_FILENO, TCSANOW, &org_opts);
+#endif
 
 	exit(0);
 }
@@ -269,6 +278,7 @@ int initSignalCatch()
 		return -1;
 	}
 
+#if defined (CONTROL_BY_KEYBOARD)
 	int res = -1;	
 	//stroe old setting
 	res = tcgetattr(STDIN_FILENO, &org_opts);
@@ -279,6 +289,7 @@ int initSignalCatch()
 	new_opts.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ECHOPRT | ECHOKE );
 	//new_opts.c_lflag &= ~(ICANON | ECHO); //is also ok
 	tcsetattr(STDIN_FILENO, TCSANOW, &new_opts);
+#endif
 
 	return 0;
 }
@@ -446,6 +457,129 @@ void *GetCharFunc(void *arg)
 	return NULL;
 }
 
+
+void *SocketRcvFunc(void *arg)
+{
+	LockObj *pLockObj = (LockObj *)arg;
+	if (NULL == pLockObj)
+	{
+		return NULL;
+	}
+
+	const int HELLO_WORLD_SERVER_PORT = 4000;
+	const int LENGTH_OF_LISTEN_QUEUE = 20;
+	const int BUFFER_SIZE = 256;
+
+    struct sockaddr_in server_addr;
+	int server_socket;
+	int opt = 1;
+   
+    bzero(&server_addr,sizeof(server_addr)); 
+	
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htons(INADDR_ANY);
+    server_addr.sin_port = htons(HELLO_WORLD_SERVER_PORT);
+	
+	char addrstr[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &(server_addr.sin_addr.s_addr), addrstr, INET_ADDRSTRLEN);
+	printf("Server: family=%d, address=%s, port=%d\n", AF_INET, addrstr, server_addr.sin_port); // prints server info
+
+	/* create a socket */
+    server_socket = socket(PF_INET,SOCK_STREAM,0);
+    if( server_socket < 0)
+    {
+        printf("Create Socket Failed!");
+        return 0;
+    }
+ 
+    /* bind socket to a specified address*/
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if( bind(server_socket,(struct sockaddr*)&server_addr,sizeof(server_addr)))
+    {
+        printf("Server Bind Port : %d Failed!", HELLO_WORLD_SERVER_PORT); 
+        return 0;
+    }
+
+    /* listen a socket */
+    if(listen(server_socket, LENGTH_OF_LISTEN_QUEUE))
+    {
+        printf("Server Listen Failed!"); 
+        return 0;
+    }
+
+	bool _bStop = false;
+
+	/* run server */
+    while (!_bStop) 
+    {
+        struct sockaddr_in client_addr;	
+        socklen_t length;
+		char buffer[BUFFER_SIZE];
+		int client_socket = -1;
+
+		printf("wait client socket connecting...\n");
+		/* accept socket from client */
+		length = sizeof(client_addr);
+        client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &length);
+        if( client_socket < 0)
+        {
+            printf("Server Accept Failed!\n");
+            break;
+        }
+		printf("client socket connected!\n");   
+
+		char ch = '\0';
+		/* receive data from client */
+		while(1)
+		{
+			bzero(buffer, BUFFER_SIZE);
+			length = recv(client_socket, buffer, BUFFER_SIZE, 0);
+			if (length < 0)
+			{
+				printf("Server Recieve Data Failed!\n");
+				break;
+			}
+			// client shutdown ok
+			else if (length == 0)
+			{
+				usleep(1000 * 1000); //sleep 1s
+				printf("Client shutdown OK!\n");
+				break;
+			}
+
+			if('q' == buffer[0])
+			{
+				printf("Quit from client!\n");
+				break;
+			}
+
+			//printf("Rcv:%*.*s\n", length, length, (char *)buffer);
+
+			if (length >= 1)
+			{
+				ch = buffer[0];
+				//printf("SocketRcv 0x:%02X, char:%c\n", ch, ch);
+
+				if (ch != 'w' && ch != 's' && ch != 'a' && ch != 'd')
+					continue;
+
+				pLockObj->zSyncObj.SyncStart();
+				g_chCommand = ch;
+				pLockObj->zSyncObj.SyncEnd();
+				pLockObj->zWaitObj.Notify();
+			}
+		}
+
+		close(client_socket);
+	}
+
+
+    close(server_socket);
+	printf("close server_socket\n");
+
+	return NULL;
+}
+
 int main(int argc,char* argv[])
 {
 	int command = 1;
@@ -476,18 +610,23 @@ int main(int argc,char* argv[])
 	//{
 	//	DoVehicleCommand(command, speedlvl);
 	//}
-
-#if defined (CONTROL_BY_IR)
+#if defined (CONTROL_BY_KEYBOARD)
+	LockObj clockObj;
+	pthread_t threadid;               /* thread id*/
+	/*create thread  */
+	pthread_create(&threadid, NULL, GetCharFunc, (void *)(&clockObj));
+#elif defined (CONTROL_BY_SOCKET)
+	LockObj clockObj;
+	pthread_t threadid;               /* thread id*/
+	/*create thread  */
+	pthread_create(&threadid, NULL, SocketRcvFunc, (void *)(&clockObj));
+#elif defined (CONTROL_BY_IR)
 	// set pin mode
 	pinMode(PIN_IR_A, INPUT);
 	pinMode(PIN_IR_B, INPUT);
 	pinMode(PIN_IR_C, INPUT);
 	pinMode(PIN_IR_D, INPUT);
-#else if defined (CONTROL_BY_KEYBOARD)
-	LockObj clockObj;
-	pthread_t threadid;               /* thread id*/
-	/*create thread  */
-	pthread_create(&threadid, NULL, GetCharFunc, (void *)(&clockObj));
+#else
 #endif
 
 	char prech = 0;
@@ -495,7 +634,13 @@ int main(int argc,char* argv[])
 	char ch = 0;	
 	while(1)
 	{
-#if defined (CONTROL_BY_IR)
+#if defined (CONTROL_BY_KEYBOARD) || (CONTROL_BY_SOCKET)
+		clockObj.zWaitObj.Wait();
+
+		clockObj.zSyncObj.SyncStart();
+		ch = g_chCommand;
+		clockObj.zSyncObj.SyncEnd();
+#elif defined (CONTROL_BY_IR)
 		if (digitalRead(PIN_IR_A) == 1)
 		{
 			ch = 'w';
@@ -516,13 +661,7 @@ int main(int argc,char* argv[])
 			//ch = '-';
 			//continue;
 		}
-
-#else if defined (CONTROL_BY_KEYBOARD)
-		clockObj.zWaitObj.Wait();
-
-		clockObj.zSyncObj.SyncStart();
-		ch = g_chCommand;
-		clockObj.zSyncObj.SyncEnd();
+#else
 #endif
 		//printf("Rcv %c\n",ch);
 
